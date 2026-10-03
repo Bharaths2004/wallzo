@@ -1,0 +1,41 @@
+# ================================================================
+# docker-compose.dev.yml
+# PURPOSE: Local development — runs ONLY PostgreSQL in Docker.
+#          Backend and Frontend run natively (npm run dev).
+# USAGE:   docker compose -f docker-compose.dev.yml up -d
+# ================================================================
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: wallzo_postgres_dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: wallzo_user
+      POSTGRES_PASSWORD: wallzo_dev_pass
+      POSTGRES_DB: wallzodb
+    ports:
+      - "5432:5432"      # Exposed so your local backend can connect
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wallzo_user -d wallzodb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional: pgAdmin web UI to view your database
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: wallzo_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@wallzo.in
+      PGADMIN_DEFAULT_PASSWORD: wallzo123
+    ports:
+      - "5050:80"        # Open http://localhost:5050 to view DB
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_dev_data:

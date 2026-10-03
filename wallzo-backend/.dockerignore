@@ -1,0 +1,16 @@
+node_modules
+.env
+.env.*
+!.env.example
+uploads
+dist
+*.log
+npm-debug.log*
+.git
+.gitignore
+README.md
+.claude
+.agents
+.cursor
+.devin
+prisma.config.ts

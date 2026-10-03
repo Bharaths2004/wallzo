@@ -1,5 +1,4 @@
-const Product = require('../models/Product');
-const PendingAction = require('../models/PendingAction');
+const prisma = require('../prisma');
 const path = require('path');
 const fs = require('fs');
 
@@ -8,25 +7,36 @@ exports.getProducts = async (req, res) => {
   try {
     const { category, subCategory, search, sort, page = 1, limit = 20 } = req.query;
 
-    const query = { status: 'active', approvalStatus: 'approved' };
+    const where = { status: 'active', approvalStatus: 'approved' };
 
-    if (category) query.category = category;
-    if (subCategory) query.subCategory = subCategory;
+    if (category) where.category = category;
+    if (subCategory) where.subCategory = subCategory;
     if (search) {
-      query.$text = { $search: search };
+      where.OR = [
+        { name: { contains: search, mode: 'insensitive' } },
+        { description: { contains: search, mode: 'insensitive' } },
+        { tags: { has: search } }
+      ];
     }
 
-    let sortObj = { createdAt: -1 };
-    if (sort === 'price-low') sortObj = { basePrice: 1 };
-    else if (sort === 'price-high') sortObj = { basePrice: -1 };
-    else if (sort === 'rating') sortObj = { rating: -1 };
-    else if (sort === 'trending') sortObj = { isTrending: -1, rating: -1 };
-    else if (sort === 'newest') sortObj = { createdAt: -1 };
+    let orderBy = { createdAt: 'desc' };
+    if (sort === 'price-low') orderBy = { basePrice: 'asc' };
+    else if (sort === 'price-high') orderBy = { basePrice: 'desc' };
+    else if (sort === 'rating') orderBy = { rating: 'desc' };
+    else if (sort === 'trending') orderBy = [ { isTrending: 'desc' }, { rating: 'desc' } ];
+    else if (sort === 'newest') orderBy = { createdAt: 'desc' };
 
     const skip = (Number(page) - 1) * Number(limit);
+    
     const [products, total] = await Promise.all([
-      Product.find(query).sort(sortObj).skip(skip).limit(Number(limit)),
-      Product.countDocuments(query)
+      prisma.product.findMany({
+        where,
+        orderBy,
+        skip,
+        take: Number(limit),
+        include: { variants: true }
+      }),
+      prisma.product.count({ where })
     ]);
 
     res.json({
@@ -43,8 +53,14 @@ exports.getProducts = async (req, res) => {
 // GET /api/products/:slug — public
 exports.getProductBySlug = async (req, res) => {
   try {
-    const product = await Product.findOne({ slug: req.params.slug, status: 'active' });
-    if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
+    const product = await prisma.product.findUnique({ 
+      where: { slug: req.params.slug },
+      include: { variants: true } 
+    });
+    
+    if (!product || product.status !== 'active') {
+      return res.status(404).json({ success: false, message: 'Product not found.' });
+    }
     res.json({ success: true, product });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -54,7 +70,10 @@ exports.getProductBySlug = async (req, res) => {
 // GET /api/products/id/:id — admin use
 exports.getProductById = async (req, res) => {
   try {
-    const product = await Product.findById(req.params.id);
+    const product = await prisma.product.findUnique({ 
+      where: { id: req.params.id },
+      include: { variants: true }
+    });
     if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
     res.json({ success: true, product });
   } catch (err) {
@@ -82,11 +101,12 @@ const buildProductData = (body, files, existingImages = []) => {
 
   return {
     name,
+    slug: name.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').trim(),
     description,
     category: category || 'posters',
     subCategory,
     images,
-    variants: parsedVariants,
+    basePrice: parsedVariants.length > 0 ? Math.min(...parsedVariants.map(v => Number(v.price))) : 0,
     tags: tags ? (typeof tags === 'string' ? tags.split(',').map(t => t.trim()) : tags) : [],
     isNew: isNew === 'true' || isNew === true,
     isTrending: isTrending === 'true' || isTrending === true,
@@ -98,23 +118,40 @@ const buildProductData = (body, files, existingImages = []) => {
 exports.createProduct = async (req, res) => {
   try {
     const productData = buildProductData(req.body, req.files);
+    
+    // Parse variants again for nested create
+    let parsedVariants = [];
+    if (req.body.variants) {
+      try { parsedVariants = typeof req.body.variants === 'string' ? JSON.parse(req.body.variants) : req.body.variants; } catch(_) {}
+    }
+
     const isSuperAdmin = req.user.role === 'super_admin';
 
     if (isSuperAdmin) {
       // Super admin: create directly
-      const product = await Product.create({
-        ...productData,
-        approvalStatus: 'approved',
-        createdBy: req.user._id,
-        approvedBy: req.user._id
+      const product = await prisma.product.create({
+        data: {
+          ...productData,
+          approvalStatus: 'approved',
+          createdById: req.user.id,
+          approvedById: req.user.id,
+          variants: {
+            create: parsedVariants.map(v => ({
+              size: v.size, sku: v.sku, stock: Number(v.stock), price: Number(v.price)
+            }))
+          }
+        },
+        include: { variants: true }
       });
       return res.status(201).json({ success: true, product, message: 'Product created successfully.' });
     } else {
       // Admin: create pending action
-      const action = await PendingAction.create({
-        type: 'ADD_PRODUCT',
-        payload: { ...productData, createdBy: req.user._id },
-        submittedBy: req.user._id
+      const action = await prisma.pendingAction.create({
+        data: {
+          type: 'ADD_PRODUCT',
+          payload: { ...productData, variants: parsedVariants },
+          submittedById: req.user.id
+        }
       });
       return res.status(202).json({
         success: true,
@@ -131,7 +168,7 @@ exports.createProduct = async (req, res) => {
 // PUT /api/products/:id — admin / super_admin
 exports.updateProduct = async (req, res) => {
   try {
-    const product = await Product.findById(req.params.id);
+    const product = await prisma.product.findUnique({ where: { id: req.params.id } });
     if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
 
     const isSuperAdmin = req.user.role === 'super_admin';
@@ -150,15 +187,34 @@ exports.updateProduct = async (req, res) => {
     }
 
     const updateData = buildProductData(req.body, req.files, existingImages);
+    
+    let parsedVariants = [];
+    if (req.body.variants) {
+      try { parsedVariants = typeof req.body.variants === 'string' ? JSON.parse(req.body.variants) : req.body.variants; } catch(_) {}
+    }
 
     if (isSuperAdmin) {
-      const updated = await Product.findByIdAndUpdate(req.params.id, updateData, { new: true, runValidators: true });
+      const updated = await prisma.product.update({
+        where: { id: req.params.id },
+        data: {
+          ...updateData,
+          variants: {
+            deleteMany: {}, // replace all existing variants
+            create: parsedVariants.map(v => ({
+              size: v.size, sku: v.sku, stock: Number(v.stock), price: Number(v.price)
+            }))
+          }
+        },
+        include: { variants: true }
+      });
       return res.json({ success: true, product: updated, message: 'Product updated.' });
     } else {
-      const action = await PendingAction.create({
-        type: 'UPDATE_PRODUCT',
-        payload: { productId: req.params.id, updates: updateData },
-        submittedBy: req.user._id
+      const action = await prisma.pendingAction.create({
+        data: {
+          type: 'UPDATE_PRODUCT',
+          payload: { productId: req.params.id, updates: { ...updateData, variants: parsedVariants } },
+          submittedById: req.user.id
+        }
       });
       return res.status(202).json({ success: true, pendingAction: action, message: 'Update submitted for approval.' });
     }
@@ -171,7 +227,7 @@ exports.updateProduct = async (req, res) => {
 // DELETE /api/products/:id — admin / super_admin
 exports.deleteProduct = async (req, res) => {
   try {
-    const product = await Product.findById(req.params.id);
+    const product = await prisma.product.findUnique({ where: { id: req.params.id } });
     if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
 
     const isSuperAdmin = req.user.role === 'super_admin';
@@ -184,13 +240,19 @@ exports.deleteProduct = async (req, res) => {
           if (fs.existsSync(fullPath)) fs.unlinkSync(fullPath);
         }
       });
-      await product.deleteOne();
+      
+      // variants are set to Cascade delete in prisma schema, or we explicitly delete them
+      await prisma.variant.deleteMany({ where: { productId: product.id } });
+      await prisma.product.delete({ where: { id: product.id } });
+      
       return res.json({ success: true, message: 'Product deleted.' });
     } else {
-      const action = await PendingAction.create({
-        type: 'DELETE_PRODUCT',
-        payload: { productId: req.params.id, productName: product.name },
-        submittedBy: req.user._id
+      const action = await prisma.pendingAction.create({
+        data: {
+          type: 'DELETE_PRODUCT',
+          payload: { productId: req.params.id, productName: product.name },
+          submittedById: req.user.id
+        }
       });
       return res.status(202).json({ success: true, pendingAction: action, message: 'Delete request submitted for approval.' });
     }
@@ -203,7 +265,11 @@ exports.deleteProduct = async (req, res) => {
 exports.updateStock = async (req, res) => {
   try {
     const { sku, stock } = req.body;
-    const product = await Product.findById(req.params.id);
+    const product = await prisma.product.findUnique({ 
+      where: { id: req.params.id },
+      include: { variants: true }
+    });
+    
     if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
 
     const isSuperAdmin = req.user.role === 'super_admin';
@@ -211,14 +277,25 @@ exports.updateStock = async (req, res) => {
     if (isSuperAdmin) {
       const variant = product.variants.find(v => v.sku === sku);
       if (!variant) return res.status(404).json({ success: false, message: 'Variant not found.' });
-      variant.stock = Number(stock);
-      await product.save();
-      return res.json({ success: true, product, message: 'Stock updated.' });
+      
+      await prisma.variant.update({
+        where: { id: variant.id },
+        data: { stock: Number(stock) }
+      });
+      
+      const updatedProduct = await prisma.product.findUnique({
+        where: { id: req.params.id },
+        include: { variants: true }
+      });
+      
+      return res.json({ success: true, product: updatedProduct, message: 'Stock updated.' });
     } else {
-      const action = await PendingAction.create({
-        type: 'UPDATE_STOCK',
-        payload: { productId: req.params.id, sku, stock: Number(stock) },
-        submittedBy: req.user._id
+      const action = await prisma.pendingAction.create({
+        data: {
+          type: 'UPDATE_STOCK',
+          payload: { productId: req.params.id, sku, stock: Number(stock) },
+          submittedById: req.user.id
+        }
       });
       return res.status(202).json({ success: true, pendingAction: action, message: 'Stock update submitted for approval.' });
     }
@@ -230,9 +307,13 @@ exports.updateStock = async (req, res) => {
 // GET /api/products/admin/all — admin sees all including drafts/pending
 exports.getAllProductsAdmin = async (req, res) => {
   try {
-    const products = await Product.find({})
-      .populate('createdBy', 'name email')
-      .sort({ createdAt: -1 });
+    const products = await prisma.product.findMany({
+      include: {
+        createdBy: { select: { name: true, email: true } },
+        variants: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
     res.json({ success: true, products });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });

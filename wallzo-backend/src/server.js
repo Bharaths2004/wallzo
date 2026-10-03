@@ -1,6 +1,5 @@
 require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
@@ -52,7 +51,8 @@ app.get('/api/health', (req, res) => {
     success: true,
     message: 'Wallzo API is running',
     timestamp: new Date().toISOString(),
-    env: process.env.NODE_ENV || 'development'
+    env: process.env.NODE_ENV || 'development',
+    db: 'PostgreSQL (Prisma)'
   });
 });
 
@@ -73,16 +73,20 @@ app.use((err, req, res, next) => {
     return res.status(400).json({ success: false, message: err.message });
   }
 
-  // Mongoose validation error
-  if (err.name === 'ValidationError') {
-    const messages = Object.values(err.errors).map(e => e.message);
-    return res.status(400).json({ success: false, message: messages.join('. ') });
+  // Prisma unique constraint violation
+  if (err.code === 'P2002') {
+    const field = err.meta && err.meta.target ? err.meta.target.join(', ') : 'Field';
+    return res.status(409).json({ success: false, message: `${field} already exists.` });
   }
 
-  // Mongoose duplicate key
-  if (err.code === 11000) {
-    const field = Object.keys(err.keyValue)[0];
-    return res.status(409).json({ success: false, message: `${field} already exists.` });
+  // Prisma record not found
+  if (err.code === 'P2025') {
+    return res.status(404).json({ success: false, message: 'Record not found.' });
+  }
+
+  // Prisma validation error
+  if (err.name === 'PrismaClientValidationError') {
+    return res.status(400).json({ success: false, message: 'Invalid data provided.' });
   }
 
   res.status(err.status || 500).json({
@@ -93,17 +97,18 @@ app.use((err, req, res, next) => {
 
 // === Database Connection & Server Start ===
 const PORT = process.env.PORT || 5000;
+const prisma = require('./prisma');
 
-mongoose.connect(process.env.MONGODB_URI)
+prisma.$connect()
   .then(() => {
-    console.log('✅ MongoDB connected');
+    console.log('✅ PostgreSQL connected via Prisma');
     app.listen(PORT, () => {
       console.log(`🚀 Wallzo API running on http://localhost:${PORT}`);
       console.log(`   Environment: ${process.env.NODE_ENV || 'development'}`);
     });
   })
   .catch(err => {
-    console.error('❌ MongoDB connection failed:', err.message);
+    console.error('❌ PostgreSQL connection failed:', err.message);
     process.exit(1);
   });
 

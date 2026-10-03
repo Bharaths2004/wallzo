@@ -1,7 +1,4 @@
-const User = require('../models/User');
-const Product = require('../models/Product');
-const Order = require('../models/Order');
-const PendingAction = require('../models/PendingAction');
+const prisma = require('../prisma');
 
 // GET /api/admin/stats — dashboard overview
 exports.getDashboardStats = async (req, res) => {
@@ -10,17 +7,21 @@ exports.getDashboardStats = async (req, res) => {
       totalUsers, totalProducts, totalOrders,
       revenueAgg, pendingActions, lowStockProducts, recentOrders
     ] = await Promise.all([
-      User.countDocuments({ isActive: true }),
-      Product.countDocuments({ status: 'active', approvalStatus: 'approved' }),
-      Order.countDocuments(),
-      Order.aggregate([{ $match: { paymentStatus: 'paid' } }, { $group: { _id: null, total: { $sum: '$total' } } }]),
-      PendingAction.countDocuments({ status: 'pending' }),
-      Product.find({ 'variants.stock': { $lte: 10, $gt: 0 }, status: 'active' })
-        .select('name images variants')
-        .limit(10),
-      Order.find().sort({ createdAt: -1 }).limit(5)
-        .populate('user', 'name email')
-        .select('orderId user total status createdAt')
+      prisma.user.count({ where: { isActive: true } }),
+      prisma.product.count({ where: { status: 'active', approvalStatus: 'approved' } }),
+      prisma.order.count(),
+      prisma.order.aggregate({ _sum: { total: true }, where: { paymentStatus: 'paid' } }),
+      prisma.pendingAction.count({ where: { status: 'pending' } }),
+      prisma.product.findMany({
+        where: { status: 'active', variants: { some: { stock: { lte: 10, gt: 0 } } } },
+        select: { id: true, name: true, images: true, variants: true },
+        take: 10
+      }),
+      prisma.order.findMany({
+        orderBy: { createdAt: 'desc' },
+        take: 5,
+        include: { user: { select: { name: true, email: true } } }
+      })
     ]);
 
     res.json({
@@ -29,10 +30,16 @@ exports.getDashboardStats = async (req, res) => {
         totalUsers,
         totalProducts,
         totalOrders,
-        totalRevenue: revenueAgg[0]?.total || 0,
+        totalRevenue: revenueAgg._sum.total || 0,
         pendingActions,
         lowStockProducts,
-        recentOrders
+        recentOrders: recentOrders.map(o => ({
+          orderId: o.orderId,
+          user: o.user,
+          total: o.total,
+          status: o.status,
+          createdAt: o.createdAt
+        }))
       }
     });
   } catch (err) {
@@ -44,7 +51,12 @@ exports.getDashboardStats = async (req, res) => {
 // GET /api/admin/users — list all users (super_admin only)
 exports.getAllUsers = async (req, res) => {
   try {
-    const users = await User.find({}).select('-password').sort({ createdAt: -1 });
+    const users = await prisma.user.findMany({
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true, name: true, email: true, role: true, avatar: true, isActive: true, createdAt: true
+      }
+    });
     res.json({ success: true, users });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -59,11 +71,14 @@ exports.updateUserRole = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Invalid role.' });
     }
     // Prevent demoting yourself
-    if (req.params.id === req.user._id.toString()) {
+    if (req.params.id === req.user.id) {
       return res.status(400).json({ success: false, message: 'Cannot change your own role.' });
     }
-    const user = await User.findByIdAndUpdate(req.params.id, { role }, { new: true }).select('-password');
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { role },
+      select: { id: true, name: true, email: true, role: true, avatar: true, isActive: true }
+    });
     res.json({ success: true, user });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -73,10 +88,14 @@ exports.updateUserRole = async (req, res) => {
 // PUT /api/admin/users/:id/toggle — activate/deactivate user (super_admin only)
 exports.toggleUserStatus = async (req, res) => {
   try {
-    const user = await User.findById(req.params.id);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    user.isActive = !user.isActive;
-    await user.save();
+    const existing = await prisma.user.findUnique({ where: { id: req.params.id } });
+    if (!existing) return res.status(404).json({ success: false, message: 'User not found.' });
+    
+    const user = await prisma.user.update({
+      where: { id: req.params.id },
+      data: { isActive: !existing.isActive },
+      select: { id: true, name: true, email: true, role: true, avatar: true, isActive: true }
+    });
     res.json({ success: true, user, message: `User ${user.isActive ? 'activated' : 'deactivated'}.` });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -86,9 +105,11 @@ exports.toggleUserStatus = async (req, res) => {
 // GET /api/admin/pending — list pending actions (super_admin only)
 exports.getPendingActions = async (req, res) => {
   try {
-    const actions = await PendingAction.find({ status: 'pending' })
-      .populate('submittedBy', 'name email role')
-      .sort({ submittedAt: -1 });
+    const actions = await prisma.pendingAction.findMany({
+      where: { status: 'pending' },
+      include: { submittedBy: { select: { name: true, email: true, role: true } } },
+      orderBy: { submittedAt: 'desc' }
+    });
     res.json({ success: true, actions });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -98,7 +119,7 @@ exports.getPendingActions = async (req, res) => {
 // POST /api/admin/pending/:id/approve — approve pending action (super_admin only)
 exports.approveAction = async (req, res) => {
   try {
-    const action = await PendingAction.findById(req.params.id);
+    const action = await prisma.pendingAction.findUnique({ where: { id: req.params.id } });
     if (!action || action.status !== 'pending') {
       return res.status(404).json({ success: false, message: 'Pending action not found.' });
     }
@@ -106,45 +127,70 @@ exports.approveAction = async (req, res) => {
     let result;
     switch (action.type) {
       case 'ADD_PRODUCT':
-        result = await Product.create({
-          ...action.payload,
-          approvalStatus: 'approved',
-          approvedBy: req.user._id
+        const addPayload = action.payload;
+        result = await prisma.product.create({
+          data: {
+            ...addPayload,
+            approvalStatus: 'approved',
+            approvedById: req.user.id,
+            variants: {
+              create: addPayload.variants || []
+            }
+          }
         });
         break;
 
       case 'UPDATE_PRODUCT':
-        result = await Product.findByIdAndUpdate(
-          action.payload.productId,
-          action.payload.updates,
-          { new: true, runValidators: true }
-        );
+        const updatePayload = action.payload;
+        
+        let variantsUpdate = {};
+        if (updatePayload.updates.variants) {
+          variantsUpdate = {
+            deleteMany: {},
+            create: updatePayload.updates.variants
+          };
+          delete updatePayload.updates.variants;
+        }
+
+        result = await prisma.product.update({
+          where: { id: updatePayload.productId },
+          data: {
+            ...updatePayload.updates,
+            variants: variantsUpdate
+          }
+        });
         break;
 
       case 'DELETE_PRODUCT':
-        result = await Product.findByIdAndDelete(action.payload.productId);
+        const delPayload = action.payload;
+        await prisma.variant.deleteMany({ where: { productId: delPayload.productId } });
+        result = await prisma.product.delete({ where: { id: delPayload.productId } });
         break;
 
       case 'UPDATE_STOCK':
-        const product = await Product.findById(action.payload.productId);
+        const stockPayload = action.payload;
+        const product = await prisma.product.findUnique({ where: { id: stockPayload.productId }, include: { variants: true } });
         if (product) {
-          const variant = product.variants.find(v => v.sku === action.payload.sku);
+          const variant = product.variants.find(v => v.sku === stockPayload.sku);
           if (variant) {
-            variant.stock = action.payload.stock;
-            await product.save();
-            result = product;
+            await prisma.variant.update({ where: { id: variant.id }, data: { stock: stockPayload.stock } });
+            result = await prisma.product.findUnique({ where: { id: product.id } });
           }
         }
         break;
     }
 
-    action.status = 'approved';
-    action.reviewedBy = req.user._id;
-    action.reviewedAt = new Date();
-    action.reviewNote = req.body.note || 'Approved';
-    await action.save();
+    const updatedAction = await prisma.pendingAction.update({
+      where: { id: req.params.id },
+      data: {
+        status: 'approved',
+        reviewedById: req.user.id,
+        reviewedAt: new Date(),
+        reviewNote: req.body.note || 'Approved'
+      }
+    });
 
-    res.json({ success: true, action, result, message: 'Action approved and executed.' });
+    res.json({ success: true, action: updatedAction, result, message: 'Action approved and executed.' });
   } catch (err) {
     console.error('Approve action error:', err);
     res.status(500).json({ success: false, message: err.message || 'Server error.' });
@@ -154,16 +200,22 @@ exports.approveAction = async (req, res) => {
 // POST /api/admin/pending/:id/reject — reject pending action (super_admin only)
 exports.rejectAction = async (req, res) => {
   try {
-    const action = await PendingAction.findById(req.params.id);
+    const action = await prisma.pendingAction.findUnique({ where: { id: req.params.id } });
     if (!action || action.status !== 'pending') {
       return res.status(404).json({ success: false, message: 'Pending action not found.' });
     }
-    action.status = 'rejected';
-    action.reviewedBy = req.user._id;
-    action.reviewedAt = new Date();
-    action.reviewNote = req.body.note || 'Rejected';
-    await action.save();
-    res.json({ success: true, action, message: 'Action rejected.' });
+    
+    const updatedAction = await prisma.pendingAction.update({
+      where: { id: req.params.id },
+      data: {
+        status: 'rejected',
+        reviewedById: req.user.id,
+        reviewedAt: new Date(),
+        reviewNote: req.body.note || 'Rejected'
+      }
+    });
+    
+    res.json({ success: true, action: updatedAction, message: 'Action rejected.' });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
@@ -172,38 +224,43 @@ exports.rejectAction = async (req, res) => {
 // GET /api/admin/analytics — advanced analytics (super_admin only)
 exports.getAnalytics = async (req, res) => {
   try {
-    const [
-      revenueLast30Days,
-      ordersByStatus,
-      topProducts
-    ] = await Promise.all([
-      // Revenue by day for last 30 days
-      Order.aggregate([
-        {
-          $match: {
-            paymentStatus: 'paid',
-            createdAt: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) }
-          }
-        },
-        {
-          $group: {
-            _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
-            revenue: { $sum: '$total' },
-            orders: { $sum: 1 }
-          }
-        },
-        { $sort: { _id: 1 } }
-      ]),
-      // Orders by status
-      Order.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
-      // Top selling products
-      Order.aggregate([
-        { $unwind: '$items' },
-        { $group: { _id: '$items.product', name: { $first: '$items.name' }, totalSold: { $sum: '$items.qty' } } },
-        { $sort: { totalSold: -1 } },
-        { $limit: 10 }
-      ])
-    ]);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+    
+    // Revenue by day requires raw query in Prisma or post-processing
+    const recentOrders = await prisma.order.findMany({
+      where: { paymentStatus: 'paid', createdAt: { gte: thirtyDaysAgo } },
+      select: { createdAt: true, total: true }
+    });
+    
+    const revenueMap = {};
+    recentOrders.forEach(o => {
+      const dateStr = o.createdAt.toISOString().split('T')[0];
+      if (!revenueMap[dateStr]) revenueMap[dateStr] = { _id: dateStr, revenue: 0, orders: 0 };
+      revenueMap[dateStr].revenue += o.total;
+      revenueMap[dateStr].orders += 1;
+    });
+    const revenueLast30Days = Object.values(revenueMap).sort((a, b) => a._id.localeCompare(b._id));
+
+    // Orders by status
+    const statusGroups = await prisma.order.groupBy({
+      by: ['status'],
+      _count: { id: true }
+    });
+    const ordersByStatus = statusGroups.map(g => ({ _id: g.status, count: g._count.id }));
+
+    // Top selling products
+    const topItems = await prisma.orderItem.groupBy({
+      by: ['productId', 'name'],
+      _sum: { qty: true },
+      orderBy: { _sum: { qty: 'desc' } },
+      take: 10
+    });
+    
+    const topProducts = topItems.map(item => ({
+      _id: item.productId,
+      name: item.name,
+      totalSold: item._sum.qty
+    }));
 
     res.json({ success: true, analytics: { revenueLast30Days, ordersByStatus, topProducts } });
   } catch (err) {

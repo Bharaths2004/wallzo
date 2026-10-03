@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const prisma = require('../prisma');
 
 // Verify JWT token
 exports.protect = async (req, res, next) => {
@@ -20,12 +20,13 @@ exports.protect = async (req, res, next) => {
     }
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(decoded.id).select('-password');
+    const user = await prisma.user.findUnique({ where: { id: decoded.id } });
 
     if (!user || !user.isActive) {
       return res.status(401).json({ success: false, message: 'User not found or deactivated.' });
     }
 
+    delete user.password;
     req.user = user;
     next();
   } catch (error) {
@@ -58,7 +59,11 @@ exports.optionalAuth = async (req, res, next) => {
     }
     if (token) {
       const decoded = jwt.verify(token, process.env.JWT_SECRET);
-      req.user = await User.findById(decoded.id).select('-password');
+      const user = await prisma.user.findUnique({ where: { id: decoded.id } });
+      if (user) {
+        delete user.password;
+        req.user = user;
+      }
     }
   } catch (_) { /* ignore auth errors for optional routes */ }
   next();

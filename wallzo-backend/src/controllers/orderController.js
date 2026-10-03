@@ -1,5 +1,4 @@
-const Order = require('../models/Order');
-const Product = require('../models/Product');
+const prisma = require('../prisma');
 
 // POST /api/orders — create order (protected)
 exports.createOrder = async (req, res) => {
@@ -13,15 +12,20 @@ exports.createOrder = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Shipping address is required.' });
     }
 
-    // Validate items, check stock, and build order items
+    // We should ideally do this in a transaction, but we will emulate the previous logic
     const orderItems = [];
     let subtotal = 0;
 
     for (const item of items) {
-      const product = await Product.findById(item.productId);
+      const product = await prisma.product.findUnique({ 
+        where: { id: item.productId },
+        include: { variants: true }
+      });
+      
       if (!product) {
         return res.status(404).json({ success: false, message: `Product not found: ${item.productId}` });
       }
+      
       const variant = product.variants.find(v => v.sku === item.sku);
       if (!variant) {
         return res.status(404).json({ success: false, message: `Variant ${item.sku} not found.` });
@@ -34,7 +38,7 @@ exports.createOrder = async (req, res) => {
       }
 
       orderItems.push({
-        product: product._id,
+        productId: product.id,
         name: product.name,
         image: product.images[0] || '',
         size: variant.size,
@@ -45,23 +49,43 @@ exports.createOrder = async (req, res) => {
       subtotal += variant.price * item.qty;
 
       // Deduct stock
-      variant.stock -= item.qty;
-      await product.save();
+      await prisma.variant.update({
+        where: { id: variant.id },
+        data: { stock: { decrement: item.qty } }
+      });
     }
 
     const shippingCharge = subtotal >= 599 ? 0 : 49;
     const total = subtotal + shippingCharge;
 
-    const order = await Order.create({
-      user: req.user._id,
-      items: orderItems,
-      shippingAddress,
-      paymentMethod,
-      paymentStatus: 'pending',
-      subtotal,
-      shippingCharge,
-      total,
-      timeline: [{ status: 'pending', note: 'Order placed successfully' }]
+    // Generate Order ID (WZ-10001+)
+    const orderCount = await prisma.order.count();
+    const orderIdStr = `WZ-${10001 + orderCount}`;
+
+    const order = await prisma.order.create({
+      data: {
+        orderId: orderIdStr,
+        userId: req.user.id,
+        paymentMethod,
+        paymentStatus: 'pending',
+        subtotal,
+        shippingCharge,
+        total,
+        shippingName: shippingAddress.name || '',
+        shippingLine1: shippingAddress.line1,
+        shippingLine2: shippingAddress.line2 || '',
+        shippingCity: shippingAddress.city,
+        shippingState: shippingAddress.state,
+        shippingPincode: shippingAddress.pincode,
+        shippingPhone: shippingAddress.phone,
+        items: {
+          create: orderItems
+        },
+        timeline: {
+          create: [{ status: 'pending', note: 'Order placed successfully' }]
+        }
+      },
+      include: { items: true, timeline: true }
     });
 
     res.status(201).json({ success: true, order });
@@ -74,19 +98,26 @@ exports.createOrder = async (req, res) => {
 // POST /api/orders/:id/pay — mock payment confirmation
 exports.confirmPayment = async (req, res) => {
   try {
-    const order = await Order.findById(req.params.id);
+    const order = await prisma.order.findUnique({ where: { id: req.params.id } });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
-    if (order.user.toString() !== req.user._id.toString()) {
+    if (order.userId !== req.user.id) {
       return res.status(403).json({ success: false, message: 'Unauthorized.' });
     }
 
-    order.paymentStatus = 'paid';
-    order.paymentId = req.body.paymentId || `PAY_${Date.now()}`;
-    order.status = 'processing';
-    order.timeline.push({ status: 'processing', note: 'Payment confirmed. Order is being processed.' });
-    await order.save();
+    const updatedOrder = await prisma.order.update({
+      where: { id: req.params.id },
+      data: {
+        paymentStatus: 'paid',
+        paymentId: req.body.paymentId || `PAY_${Date.now()}`,
+        status: 'processing',
+        timeline: {
+          create: { status: 'processing', note: 'Payment confirmed. Order is being processed.' }
+        }
+      },
+      include: { timeline: true }
+    });
 
-    res.json({ success: true, order });
+    res.json({ success: true, order: updatedOrder });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
@@ -95,9 +126,16 @@ exports.confirmPayment = async (req, res) => {
 // GET /api/orders/my — user's own orders
 exports.getMyOrders = async (req, res) => {
   try {
-    const orders = await Order.find({ user: req.user._id })
-      .populate('items.product', 'name slug images')
-      .sort({ createdAt: -1 });
+    const orders = await prisma.order.findMany({ 
+      where: { userId: req.user.id },
+      include: { 
+        items: {
+          include: { product: { select: { name: true, slug: true, images: true } } }
+        },
+        timeline: true
+      },
+      orderBy: { createdAt: 'desc' }
+    });
     res.json({ success: true, orders });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -108,17 +146,22 @@ exports.getMyOrders = async (req, res) => {
 exports.getAllOrders = async (req, res) => {
   try {
     const { status, page = 1, limit = 20 } = req.query;
-    const query = status ? { status } : {};
+    const where = status ? { status } : {};
     const skip = (Number(page) - 1) * Number(limit);
 
     const [orders, total] = await Promise.all([
-      Order.find(query)
-        .populate('user', 'name email')
-        .populate('items.product', 'name images')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(Number(limit)),
-      Order.countDocuments(query)
+      prisma.order.findMany({
+        where,
+        include: {
+          user: { select: { name: true, email: true } },
+          items: { include: { product: { select: { name: true, images: true } } } },
+          timeline: true
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: Number(limit)
+      }),
+      prisma.order.count({ where })
     ]);
 
     res.json({ success: true, orders, pagination: { page: Number(page), limit: Number(limit), total } });
@@ -131,18 +174,24 @@ exports.getAllOrders = async (req, res) => {
 exports.updateOrderStatus = async (req, res) => {
   try {
     const { status, note, trackingNumber } = req.body;
-    const order = await Order.findById(req.params.id);
+    const order = await prisma.order.findUnique({ where: { id: req.params.id } });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
 
-    order.status = status;
-    if (trackingNumber) order.trackingNumber = trackingNumber;
-    order.timeline.push({
-      status,
-      note: note || `Status updated to ${status}`,
-    });
-    await order.save();
+    const updateData = { status };
+    if (trackingNumber) updateData.trackingNumber = trackingNumber;
 
-    res.json({ success: true, order });
+    const updatedOrder = await prisma.order.update({
+      where: { id: req.params.id },
+      data: {
+        ...updateData,
+        timeline: {
+          create: { status, note: note || `Status updated to ${status}` }
+        }
+      },
+      include: { timeline: true }
+    });
+
+    res.json({ success: true, order: updatedOrder });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
@@ -151,21 +200,21 @@ exports.updateOrderStatus = async (req, res) => {
 // GET /api/orders/stats — dashboard stats (admin+)
 exports.getOrderStats = async (req, res) => {
   try {
-    const [totalOrders, totalRevenue, pendingOrders, processingOrders] = await Promise.all([
-      Order.countDocuments(),
-      Order.aggregate([
-        { $match: { paymentStatus: 'paid' } },
-        { $group: { _id: null, total: { $sum: '$total' } } }
-      ]),
-      Order.countDocuments({ status: 'pending' }),
-      Order.countDocuments({ status: 'processing' })
+    const [totalOrders, revAgg, pendingOrders, processingOrders] = await Promise.all([
+      prisma.order.count(),
+      prisma.order.aggregate({
+        _sum: { total: true },
+        where: { paymentStatus: 'paid' }
+      }),
+      prisma.order.count({ where: { status: 'pending' } }),
+      prisma.order.count({ where: { status: 'processing' } })
     ]);
 
     res.json({
       success: true,
       stats: {
         totalOrders,
-        totalRevenue: totalRevenue[0]?.total || 0,
+        totalRevenue: revAgg._sum.total || 0,
         pendingOrders,
         processingOrders
       }

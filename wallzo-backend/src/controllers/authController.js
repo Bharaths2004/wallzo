@@ -1,22 +1,23 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
+const bcrypt = require('bcryptjs');
+const prisma = require('../prisma');
 
 const signToken = (id) =>
   jwt.sign({ id }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
 
 const sendToken = (user, statusCode, res) => {
-  const token = signToken(user._id);
+  const token = signToken(user.id);
   res.status(statusCode).json({
     success: true,
     token,
     user: {
-      id: user._id,
+      id: user.id,
       name: user.name,
       email: user.email,
       role: user.role,
       avatar: user.avatar,
-      addresses: user.addresses,
-      wishlist: user.wishlist
+      addresses: user.addresses || [],
+      wishlist: user.wishlist || []
     }
   });
 };
@@ -33,12 +34,23 @@ exports.register = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Password must be at least 6 characters.' });
     }
 
-    const existing = await User.findOne({ email: email.toLowerCase() });
+    const existing = await prisma.user.findUnique({ where: { email: email.toLowerCase() } });
     if (existing) {
       return res.status(409).json({ success: false, message: 'An account with this email already exists.' });
     }
 
-    const user = await User.create({ name, email, password });
+    const hashedPassword = await bcrypt.hash(password, 12);
+    const avatar = name.charAt(0).toUpperCase();
+
+    const user = await prisma.user.create({
+      data: { 
+        name, 
+        email: email.toLowerCase(), 
+        password: hashedPassword,
+        avatar
+      }
+    });
+
     sendToken(user, 201, res);
   } catch (err) {
     console.error('Register error:', err);
@@ -55,12 +67,16 @@ exports.login = async (req, res) => {
       return res.status(400).json({ success: false, message: 'Email and password are required.' });
     }
 
-    const user = await User.findOne({ email: email.toLowerCase() }).select('+password');
+    const user = await prisma.user.findUnique({
+      where: { email: email.toLowerCase() },
+      include: { addresses: true, wishlist: true }
+    });
+
     if (!user || !user.isActive) {
       return res.status(401).json({ success: false, message: 'Invalid email or password.' });
     }
 
-    const isMatch = await user.comparePassword(password);
+    const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(401).json({ success: false, message: 'Invalid email or password.' });
     }
@@ -75,7 +91,18 @@ exports.login = async (req, res) => {
 // GET /api/auth/me  (protected)
 exports.getMe = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).populate('wishlist', 'name slug images basePrice');
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      include: { 
+        wishlist: {
+          select: { id: true, name: true, slug: true, images: true, basePrice: true }
+        },
+        addresses: true
+      }
+    });
+    
+    // don't send password
+    delete user.password;
     res.json({ success: true, user });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
@@ -86,13 +113,37 @@ exports.getMe = async (req, res) => {
 exports.updateProfile = async (req, res) => {
   try {
     const { name, addresses } = req.body;
-    const updates = {};
-    if (name) updates.name = name;
-    if (addresses) updates.addresses = addresses;
+    
+    const updateData = {};
+    if (name) updateData.name = name;
+    
+    if (addresses) {
+      // Prisma requires nested writes for relations
+      updateData.addresses = {
+        deleteMany: {}, // replace all existing
+        create: addresses.map(addr => ({
+          label: addr.label,
+          name: addr.name,
+          line1: addr.line1,
+          line2: addr.line2,
+          city: addr.city,
+          state: addr.state,
+          pincode: addr.pincode,
+          phone: addr.phone
+        }))
+      };
+    }
 
-    const user = await User.findByIdAndUpdate(req.user._id, updates, { new: true, runValidators: true });
+    const user = await prisma.user.update({
+      where: { id: req.user.id },
+      data: updateData,
+      include: { addresses: true }
+    });
+    
+    delete user.password;
     res.json({ success: true, user });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
@@ -100,17 +151,36 @@ exports.updateProfile = async (req, res) => {
 // POST /api/auth/wishlist/:productId  (protected) — toggle
 exports.toggleWishlist = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id);
     const productId = req.params.productId;
-    const idx = user.wishlist.findIndex(id => id.toString() === productId);
-
-    if (idx > -1) {
-      user.wishlist.splice(idx, 1);
+    
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      include: { wishlist: { select: { id: true } } }
+    });
+    
+    const hasProduct = user.wishlist.some(p => p.id === productId);
+    
+    let updatedUser;
+    if (hasProduct) {
+      updatedUser = await prisma.user.update({
+        where: { id: req.user.id },
+        data: {
+          wishlist: { disconnect: { id: productId } }
+        },
+        include: { wishlist: { select: { id: true } } }
+      });
     } else {
-      user.wishlist.push(productId);
+      updatedUser = await prisma.user.update({
+        where: { id: req.user.id },
+        data: {
+          wishlist: { connect: { id: productId } }
+        },
+        include: { wishlist: { select: { id: true } } }
+      });
     }
-    await user.save();
-    res.json({ success: true, wishlist: user.wishlist });
+    
+    const wishlistIds = updatedUser.wishlist.map(p => p.id);
+    res.json({ success: true, wishlist: wishlistIds });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Server error.' });
   }
